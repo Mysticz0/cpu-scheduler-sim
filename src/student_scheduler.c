@@ -31,6 +31,7 @@ typedef struct {
     int bursts_complete;
     int remaining_time_cpu_burst;
     int io_completion_time;
+    int quantum_used;
     /* TODO: add the rest of your PCB fields. */
 } PCB;
 
@@ -41,8 +42,9 @@ typedef struct {
     int size;
 } Queue;
 
-
+PCB *remove_pcb_in_queue(Queue *ready_queue, int position);
 bool queue_is_empty(const Queue *ready_queue);
+int find_shortest_ready_burst(const Queue *ready_queue);
 void ready_enqueue(PCB *pcb, Queue *ready_queue);
 void print_pcb(PCB *current_pcb);
 bool initialize_pcbs(PCB *pcbs, const ProcessSpec *specs, size_t count);
@@ -51,10 +53,11 @@ bool is_process_running(PCB *pcbs, size_t count);
 bool are_pcbs_terminated(PCB *pcbs, size_t count);
 void admit_arrivals(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue);
 void complete_io(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue);
-void resolve_cpu_interval(PCB *pcbs, size_t count, size_t time, OutputContext *output, TimelineActivity *cpu_status);
+void resolve_cpu_interval(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, const SimulationConfig *config);
 void advance_one_interval(PCB *pcbs, size_t count, size_t time, OutputContext *output, TimelineActivity cpu_status, int *context_switch);
-void choose_next_process(size_t time, OutputContext *output, Queue *ready_queue);
-void update_dispatch(size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, int *context_switch, int new_config_switch_duration);
+void choose_next_process(size_t time, OutputContext *output, Queue *ready_queue, Algorithm algorithm);
+void update_dispatch(size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, int *context_switch, const SimulationConfig *config);
+void maybe_preempt_srtf(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, Algorithm algorithm);
 
 /* You may choose to maintain a structure for your queues.
  * Do so in whichever way you see fit.
@@ -144,13 +147,22 @@ bool initialize_pcbs(PCB *pcbs, const ProcessSpec *specs, size_t count){
         pcbs[i].bursts_complete = 0;
         pcbs[i].remaining_time_cpu_burst = pcbs[i].spec.cpu_burst;
         pcbs[i].io_completion_time = pcbs[i].spec.arrival_time + pcbs[i].spec.cpu_burst + pcbs[i].spec.io_burst;
+        pcbs[i].quantum_used = 0;
     }
     return true;
 }
 
 
 void print_pcb(PCB *current_pcb){
-    printf("PID = %d\n ARRIVAL TIME = %d\n CPU BURST = %d\n IO BURST = %d\n NUM CPU BURSTS = %d\n STATE = %d\n COMPLETED CPU BURSTS = %d\n TIME REMAINING IN CURRENT BURST = %d\n", 
+    printf("PID = %d\n"
+           "ARRIVAL TIME = %d\n"
+           "CPU BURST = %d\n" 
+           "IO BURST = %d\n" 
+           "NUM CPU BURSTS = %d\n" 
+           "STATE = %d\n" 
+           "COMPLETED CPU BURSTS = %d\n" 
+           "TIME REMAINING IN CURRENT BURST = %d\n" 
+           "QUANTUM USED = %d", 
         current_pcb->spec.pid, 
         current_pcb->spec.arrival_time, 
         current_pcb->spec.cpu_burst, 
@@ -158,7 +170,8 @@ void print_pcb(PCB *current_pcb){
         current_pcb->spec.num_cpu_bursts, 
         current_pcb->state,
         current_pcb->bursts_complete,
-        current_pcb->remaining_time_cpu_burst);
+        current_pcb->remaining_time_cpu_burst,
+        current_pcb->quantum_used);
 }
 
 void print_pcbs(PCB *pcbs, size_t count){
@@ -168,17 +181,13 @@ void print_pcbs(PCB *pcbs, size_t count){
 }
 
 bool is_cpu_busy(TimelineActivity cpu_status){
-    if (cpu_status == ACTIVITY_CPU){
-        return true;
-    }
+    if (cpu_status == ACTIVITY_CPU) return true;
     return false;
 }
 
 bool are_pcbs_terminated(PCB *pcbs, size_t count){
     for (size_t i = 0; i < count; i++){
-        if (pcbs[i].state != STATE_TERMINATED){
-            return false;
-        }
+        if (pcbs[i].state != STATE_TERMINATED) return false;
     }
     return true;
 }
@@ -190,13 +199,30 @@ void ready_enqueue(PCB *pcb, Queue *ready_queue){
     printf("ENQUEUED PCB %d\n", pcb->spec.pid);
 }
 
-void choose_next_process(size_t time, OutputContext *output, Queue *ready_queue){
-    PCB *next = ready_queue->ready_processes[ready_queue->front];
-    ProcessState prevState = next->state;
-    
-    ready_queue->front = (ready_queue->front + 1) % MAX_PROCESSES;
+PCB *remove_pcb_in_queue(Queue *ready_queue, int position){
+    int index = (ready_queue->front + position) % MAX_PROCESSES;
+    PCB *pcb = ready_queue->ready_processes[index];
+
+    for (int i = position; i < ready_queue-> size - 1; i++){
+        int current = (ready_queue->front + i) % MAX_PROCESSES;
+        int next = (ready_queue->front + i + 1) % MAX_PROCESSES;
+        ready_queue->ready_processes[current] = ready_queue->ready_processes[next];
+    }
+
+    ready_queue->rear = (ready_queue->rear - 1 + MAX_PROCESSES) % MAX_PROCESSES;
     ready_queue->size--;
+    return pcb;
+}
+
+void choose_next_process(size_t time, OutputContext *output, Queue *ready_queue, Algorithm algorithm){
+    int position = 0;
+    if (algorithm == ALG_SRTF) position = find_shortest_ready_burst(ready_queue);
+
+    PCB *next = remove_pcb_in_queue(ready_queue, position);
+    ProcessState prevState = next->state;
+
     next->state = STATE_RUNNING;
+    next->quantum_used = 0;
     printf("PCB %d RUNNING\n", next->spec.pid);
     log_transition(output, time, next->spec.pid, prevState, STATE_RUNNING, REASON_DISPATCH);
 }
@@ -221,31 +247,42 @@ void admit_arrivals(PCB *pcbs,
 
 }
 
-void resolve_cpu_interval(PCB *pcbs, size_t count, size_t time, OutputContext *output, TimelineActivity *cpu_status){
-    if (*cpu_status != ACTIVITY_CPU) {
-        return;
-    }
+void resolve_cpu_interval(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, const SimulationConfig *config){
+    if (*cpu_status != ACTIVITY_CPU) return;
 
+    PCB *running_pcb = NULL;
     for (size_t i = 0; i < count; i++){
-        if (pcbs[i].state == STATE_RUNNING && pcbs[i].remaining_time_cpu_burst == 0){
-            pcbs[i].bursts_complete++;
-
-            if (pcbs[i].bursts_complete < pcbs[i].spec.num_cpu_bursts){
-                log_transition(output, time, pcbs[i].spec.pid, pcbs[i].state, STATE_WAITING, REASON_CPU_BURST_COMPLETE);
-                pcbs[i].state = STATE_WAITING;
-                pcbs[i].io_completion_time = time + pcbs[i].spec.io_burst;
-                pcbs[i].remaining_time_cpu_burst = pcbs[i].spec.cpu_burst;
-                printf("PCB %d WAITING\n", pcbs[i].spec.pid);
-            } else {
-                log_transition(output, time, pcbs[i].spec.pid, pcbs[i].state, STATE_TERMINATED, REASON_PROCESS_COMPLETE);
-                pcbs[i].state = STATE_TERMINATED;
-                printf("PCB %d TERMINATED\n", pcbs[i].spec.pid);
-            }
-
-            *cpu_status = ACTIVITY_IDLE;
+        if (pcbs[i].state == STATE_RUNNING){
+            running_pcb = &pcbs[i];
+            break;
         }
     }
+    if (running_pcb == NULL) return;
 
+    
+    if (running_pcb->remaining_time_cpu_burst == 0){
+        running_pcb->bursts_complete++;
+
+        if (running_pcb->bursts_complete < running_pcb->spec.num_cpu_bursts){
+            log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_WAITING, REASON_CPU_BURST_COMPLETE);
+            running_pcb->state = STATE_WAITING;
+            running_pcb->io_completion_time = time + running_pcb->spec.io_burst;
+            running_pcb->remaining_time_cpu_burst = running_pcb->spec.cpu_burst;
+            printf("PCB %d WAITING\n", running_pcb->spec.pid);
+        } else {
+            log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_TERMINATED, REASON_PROCESS_COMPLETE);
+            running_pcb->state = STATE_TERMINATED;
+            printf("PCB %d TERMINATED\n", running_pcb->spec.pid);
+        }
+
+        *cpu_status = ACTIVITY_IDLE;
+        
+    } else if (config->algorithm == ALG_RR && running_pcb->quantum_used == config->quantum){
+        log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_READY, REASON_QUANTUM_EXPIRED);
+        running_pcb->state = STATE_READY;
+        ready_enqueue(running_pcb, ready_queue);
+        *cpu_status = ACTIVITY_IDLE;
+    }
 }
 
 void complete_io(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue) {
@@ -264,6 +301,7 @@ void advance_one_interval(PCB *pcbs, size_t count, size_t time, OutputContext *o
             for (size_t i = 0; i < count; i++) {
                 if (pcbs[i].state == STATE_RUNNING) {
                     pcbs[i].remaining_time_cpu_burst--;
+                    pcbs[i].quantum_used++;
                     record_timeline_tick(output, time, ACTIVITY_CPU, pcbs[i].spec.pid);
                     break;
                 }
@@ -281,14 +319,50 @@ void advance_one_interval(PCB *pcbs, size_t count, size_t time, OutputContext *o
     }
 }
 
-void update_dispatch(size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, int *context_switch, int new_config_switch_duration) {
+void update_dispatch(size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, int *context_switch, const SimulationConfig *config) {
     if (*cpu_status == ACTIVITY_IDLE && !queue_is_empty(ready_queue)) {
-        *context_switch = new_config_switch_duration;
+        *context_switch = config->context_switch;
         *cpu_status = ACTIVITY_CONTEXT_SWITCH;
     }
     if (*cpu_status == ACTIVITY_CONTEXT_SWITCH && *context_switch == 0) {
-        choose_next_process(time, output, ready_queue);
+        choose_next_process(time, output, ready_queue, config->algorithm);
         *cpu_status = ACTIVITY_CPU;
+    }
+}
+
+int find_shortest_ready_burst(const Queue *ready_queue){
+    int best = -1;
+    for (int i = 0; i < ready_queue->size; i++){
+        PCB *pcb = ready_queue->ready_processes[(ready_queue->front + i) % MAX_PROCESSES];
+        PCB *best_pcb = NULL;
+        if (best >= 0) best_pcb = ready_queue->ready_processes[(ready_queue->front + best) % MAX_PROCESSES];
+        if (best_pcb == NULL || pcb->remaining_time_cpu_burst < best_pcb->remaining_time_cpu_burst) best = i;
+    }
+    return best;
+}
+
+void maybe_preempt_srtf(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue, TimelineActivity *cpu_status, Algorithm algorithm){
+    if (algorithm != ALG_SRTF || *cpu_status != ACTIVITY_CPU) return;
+
+    int pcb_position = find_shortest_ready_burst(ready_queue);
+    if (pcb_position < 0) return;
+    PCB *shortest_burst_pcb = ready_queue->ready_processes[(ready_queue->front + pcb_position) % MAX_PROCESSES];
+
+    PCB *running_pcb = NULL;
+    for (size_t i = 0; i < count; i++){
+        if (pcbs[i].state == STATE_RUNNING){
+            running_pcb = &pcbs[i];
+            break;
+        }
+    }
+    if (running_pcb == NULL) return;
+    
+    
+    if (shortest_burst_pcb->remaining_time_cpu_burst < running_pcb->remaining_time_cpu_burst){
+        running_pcb->state = STATE_READY;
+        log_transition(output, time, running_pcb->spec.pid, STATE_RUNNING, STATE_READY, REASON_SRTF_PREEMPTION);
+        ready_enqueue(running_pcb, ready_queue);
+        *cpu_status = ACTIVITY_IDLE;
     }
 }
 
@@ -329,9 +403,7 @@ bool run_simulation(const ProcessSpec *specs,
 
     // Initialize PCBs
     PCB *pcbs = malloc(count * sizeof(PCB));
-    if (!initialize_pcbs(pcbs, specs, count)){
-        return false;
-    }
+    if (!initialize_pcbs(pcbs, specs, count)) return false;
 
     print_pcbs(pcbs, count);
     printf("\n\n======================================================\n\n");
@@ -345,16 +417,16 @@ bool run_simulation(const ProcessSpec *specs,
     TimelineActivity cpu_status = ACTIVITY_IDLE;
     int context_switch = 0;
 
-    while (!are_pcbs_terminated(pcbs, count)) {                                                       // while not all processes are terminated:
+    while (!are_pcbs_terminated(pcbs, count)) {                                                               // while not all processes are terminated:
         printf("TICK: %ld\n", time);
-        resolve_cpu_interval(pcbs, count, time, output, &cpu_status);                                 // resolve the CPU interval that ended at the current time
+        resolve_cpu_interval(pcbs, count, time, output, &ready_queue, &cpu_status, config);                   // resolve the CPU interval that ended at the current time
         if (are_pcbs_terminated(pcbs, count)) break;
-        admit_arrivals(pcbs, count, time, output, &ready_queue);                                                    // admit arrivals in ascending PID order
-        complete_io(pcbs, count, time, output, &ready_queue);                                                       // complete I/O in ascending PID order
-                                                                                                                // apply the SRTF preemption rule, if applicable
-        update_dispatch(time, output, &ready_queue, &cpu_status, &context_switch, config->context_switch);    // complete or begin dispatch/context-switch activity 
-        advance_one_interval(pcbs, count, time, output, cpu_status, &context_switch);                                                // record exactly one CPU, context-switch, or idle timeline tick
-        time++;                                                                                                     // advance time by one
+        admit_arrivals(pcbs, count, time, output, &ready_queue);                                              // admit arrivals in ascending PID order
+        complete_io(pcbs, count, time, output, &ready_queue);                                                 // complete I/O in ascending PID order
+        maybe_preempt_srtf(pcbs, count, time, output, &ready_queue, &cpu_status, config->algorithm);          // apply the SRTF preemption rule, if applicable
+        update_dispatch(time, output, &ready_queue, &cpu_status, &context_switch, config);                    // complete or begin dispatch/context-switch activity 
+        advance_one_interval(pcbs, count, time, output, cpu_status, &context_switch);                         // record exactly one CPU, context-switch, or idle timeline tick
+        time++;                                                                                               // advance time by one
     }
 
     free(pcbs);
