@@ -174,7 +174,7 @@ void print_pcb(PCB *current_pcb){
            "STATE = %d\n" 
            "COMPLETED CPU BURSTS = %d\n" 
            "TIME REMAINING IN CURRENT BURST = %d\n" 
-           "QUANTUM USED = %d", 
+           "QUANTUM USED = %d\n", 
         current_pcb->spec.pid, 
         current_pcb->spec.arrival_time, 
         current_pcb->spec.cpu_burst, 
@@ -228,7 +228,6 @@ void admit_arrivals(PCB *pcbs,
         if (pcbs[i].state == STATE_NEW && pcbs[i].spec.arrival_time == (int)time){
             prevState = pcbs[i].state;
             pcbs[i].state = STATE_READY;
-            printf("PCB %d READY\n", pcbs[i].spec.pid);
             log_transition(output, time, pcbs[i].spec.pid, prevState, STATE_READY, REASON_ARRIVAL);
             ready_enqueue(&pcbs[i], ready_queue);
         }
@@ -267,11 +266,9 @@ void resolve_cpu_interval(PCB *pcbs, size_t count, size_t time, OutputContext *o
             running_pcb->state = STATE_WAITING;
             running_pcb->io_completion_time = time + running_pcb->spec.io_burst;
             running_pcb->remaining_time_cpu_burst = running_pcb->spec.cpu_burst;
-            printf("PCB %d WAITING\n", running_pcb->spec.pid);
         } else {
             log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_TERMINATED, REASON_PROCESS_COMPLETE);
             running_pcb->state = STATE_TERMINATED;
-            printf("PCB %d TERMINATED\n", running_pcb->spec.pid);
         }
 
         *cpu_status = ACTIVITY_IDLE;
@@ -317,7 +314,6 @@ void choose_next_process(size_t time, OutputContext *output, Queue *ready_queue,
 
     next->state = STATE_RUNNING;
     next->quantum_used = 0;
-    printf("PCB %d RUNNING\n", next->spec.pid);
     log_transition(output, time, next->spec.pid, prevState, STATE_RUNNING, REASON_DISPATCH);
 }
 

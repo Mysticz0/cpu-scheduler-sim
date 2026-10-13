@@ -2,4 +2,5 @@ output/
 report_scenarios/
 fcfs_out/
 rr_out/
+rrq10_out/
 srtf_out/
