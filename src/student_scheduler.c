@@ -197,7 +197,7 @@ bool initialize_pcbs(PCB *pcbs, const ProcessSpec *specs, size_t count){
         pcbs[i].state = STATE_NEW;
         pcbs[i].bursts_complete = 0;
         pcbs[i].remaining_time_cpu_burst = pcbs[i].spec.cpu_burst;
-        pcbs[i].io_completion_time = pcbs[i].spec.arrival_time + pcbs[i].spec.cpu_burst + pcbs[i].spec.io_burst;
+        pcbs[i].io_completion_time = 0;
         pcbs[i].quantum_used = 0;
     }
     return true;
@@ -222,25 +222,21 @@ void admit_arrivals(PCB *pcbs,
                     OutputContext *output, 
                     Queue *ready_queue)
 {
-    ProcessState prevState;
-
     for (size_t i = 0; i < count; i++){
         if (pcbs[i].state == STATE_NEW && pcbs[i].spec.arrival_time == (int)time){
-            prevState = pcbs[i].state;
             pcbs[i].state = STATE_READY;
-            log_transition(output, time, pcbs[i].spec.pid, prevState, STATE_READY, REASON_ARRIVAL);
+            log_transition(output, time, pcbs[i].spec.pid, STATE_NEW, STATE_READY, REASON_ARRIVAL);
             ready_enqueue(&pcbs[i], ready_queue);
         }
     }
-
 }
 
 void complete_io(PCB *pcbs, size_t count, size_t time, OutputContext *output, Queue *ready_queue) {
     for (size_t i = 0; i < count; i++){
         if (pcbs[i].state == STATE_WAITING && pcbs[i].io_completion_time == (int)time){
-            log_transition(output, time, pcbs[i].spec.pid, pcbs[i].state, STATE_READY, REASON_IO_COMPLETE);
             pcbs[i].state = STATE_READY;
             ready_enqueue(&pcbs[i], ready_queue);
+            log_transition(output, time, pcbs[i].spec.pid, STATE_WAITING, STATE_READY, REASON_IO_COMPLETE);
         }
     }
 }
@@ -262,21 +258,21 @@ void resolve_cpu_interval(PCB *pcbs, size_t count, size_t time, OutputContext *o
         running_pcb->bursts_complete++;
 
         if (running_pcb->bursts_complete < running_pcb->spec.num_cpu_bursts){
-            log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_WAITING, REASON_CPU_BURST_COMPLETE);
             running_pcb->state = STATE_WAITING;
             running_pcb->io_completion_time = time + running_pcb->spec.io_burst;
             running_pcb->remaining_time_cpu_burst = running_pcb->spec.cpu_burst;
+            log_transition(output, time, running_pcb->spec.pid, STATE_RUNNING, STATE_WAITING, REASON_CPU_BURST_COMPLETE);
         } else {
-            log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_TERMINATED, REASON_PROCESS_COMPLETE);
             running_pcb->state = STATE_TERMINATED;
+            log_transition(output, time, running_pcb->spec.pid, STATE_RUNNING, STATE_TERMINATED, REASON_PROCESS_COMPLETE);
         }
 
         *cpu_status = ACTIVITY_IDLE;
         
     } else if (config->algorithm == ALG_RR && running_pcb->quantum_used == config->quantum){
-        log_transition(output, time, running_pcb->spec.pid, running_pcb->state, STATE_READY, REASON_QUANTUM_EXPIRED);
         running_pcb->state = STATE_READY;
         ready_enqueue(running_pcb, ready_queue);
+        log_transition(output, time, running_pcb->spec.pid, STATE_RUNNING, STATE_READY, REASON_QUANTUM_EXPIRED);
         *cpu_status = ACTIVITY_IDLE;
     }
 }
@@ -347,8 +343,8 @@ void maybe_preempt_srtf(PCB *pcbs, size_t count, size_t time, OutputContext *out
     
     if (shortest_burst_pcb->remaining_time_cpu_burst < running_pcb->remaining_time_cpu_burst){
         running_pcb->state = STATE_READY;
-        log_transition(output, time, running_pcb->spec.pid, STATE_RUNNING, STATE_READY, REASON_SRTF_PREEMPTION);
         ready_enqueue(running_pcb, ready_queue);
+        log_transition(output, time, running_pcb->spec.pid, STATE_RUNNING, STATE_READY, REASON_SRTF_PREEMPTION);
         *cpu_status = ACTIVITY_IDLE;
     }
 }
@@ -391,7 +387,7 @@ bool run_simulation(const ProcessSpec *specs,
     PCB *pcbs = malloc(count * sizeof(PCB));
     if (!initialize_pcbs(pcbs, specs, count)) return false;
 
-    print_pcbs(pcbs, count);
+    // print_pcbs(pcbs, count);
 
     // Main Simulation Loop
     size_t time = 0;
